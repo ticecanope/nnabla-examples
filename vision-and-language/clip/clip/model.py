@@ -173,15 +173,14 @@ def vision_transformer(x, input_res, patch_size, v_width, v_layers, v_heads, emb
         x = F.reshape(x, (x.shape[0], x.shape[1], -1))
         x = F.transpose(x, (0, 2, 1))  # shape = [*, grid ** 2, width]
 
-        z = np.zeros((x.shape[0], 1, x.shape[-1]))
-        zeros = nn.Variable.from_numpy_array(z)
+        zeros = F.constant(0, (x.shape[0], 1, x.shape[-1]))
         class_embed = nn.parameter.get_parameter_or_create(
-            name="class_embedding", shape=(v_width,)).reshape((x.shape[0], 1, v_width))
+            name="class_embedding", shape=(v_width,)).reshape((1, 1, v_width))
         # shape = [*, grid ** 2 + 1, width]
         x = F.concatenate(class_embed + zeros, x, axis=1)
 
         positional_embedding = nn.parameter.get_parameter_or_create(
-            name='positional_embedding', shape=((input_res // patch_size) ** 2 + 1, v_width)).reshape((x.shape[0], x.shape[1], v_width))
+            name='positional_embedding', shape=((input_res // patch_size) ** 2 + 1, v_width)).reshape((1, x.shape[1], v_width))
         x = x + positional_embedding
 
         ln_pre_w = nn.parameter.get_parameter_or_create(
@@ -270,9 +269,10 @@ def encode_text(text):
         name='ln_final/b', shape=(transformer_width,)).reshape((1, 1, transformer_width))
     x = F.layer_normalization(x, ln_final_b, ln_final_W, batch_axis=(0, 1))
 
-    idx = F.max(text, axis=-1, only_index=True)
-    idx.forward()
-    x = x[list(range(x.shape[0])), idx.d].reshape((1, x.shape[0], -1))
+    idx = F.max(text, axis=-1, keepdims=True, only_index=True)
+    idx_mask = F.one_hot(idx, shape=(x.shape[1],)).reshape(
+        (x.shape[0], x.shape[1], 1))
+    x = F.sum(x * idx_mask, axis=1).reshape((1, x.shape[0], -1))
     text_projection = nn.parameter.get_parameter_or_create(
         name='text_projection', shape=(transformer_width, embed_dim)).reshape((1, transformer_width, embed_dim))
     x = F.batch_matmul(x, text_projection)
@@ -321,13 +321,24 @@ def logits(image, text):
     return logits_per_image, logits_per_text
 
 
-class CLIP():
-    def __init__(self) -> None:
-        self.text_enc = transformer
+def cosine_similarity(image_features: nn.Variable, text_features: nn.Variable) -> nn.Variable:
+    # normalized features
+    image_features = image_features / \
+        F.norm(image_features, axis=1, keepdims=True)
+    text_features = text_features / \
+        F.norm(text_features, axis=1, keepdims=True)
 
-    def encode(self, x):
-        t_e = self.text_enc(x)
+    # cosine similarity as logits
+    logit_scale = nn.parameter.get_parameter_or_create(
+        name='logit_scale', shape=())
+    logit_scale = F.exp(logit_scale)
 
+    image_features = image_features.reshape(
+        (1, image_features.shape[0], image_features.shape[1]))
+    text_features = text_features.reshape(
+        (1, text_features.shape[0], text_features.shape[1]))
 
-def build_model():
-    return encode_text
+    per_image = F.batch_matmul(image_features, text_features, transpose_b=True).reshape(
+        (image_features.shape[0], -1))
+    logits_per_image = logit_scale.reshape((1, 1)) * per_image
+    return logits_per_image

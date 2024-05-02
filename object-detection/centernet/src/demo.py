@@ -20,16 +20,10 @@ from __future__ import print_function
 import _init_paths
 
 import os
-import cv2
-import numpy as np
-
 import nnabla as nn
 from nnabla.ext_utils import get_extension_context
-import nnabla.functions as F
-from nnabla.utils.nnp_graph import NnpLoader
 
 from opts import opts
-from models.decode import ctdet_decode
 from detectors.detector_factory import detector_factory
 
 image_ext = ['jpg', 'jpeg', 'png', 'webp']
@@ -42,18 +36,18 @@ def demo(opt):
     '''
 
     os.environ['CUDA_VISIBLE_DEVICES'] = opt.gpus_str
-    if opt.checkpoint == '':
+    if opt.trained_model_path == '':
         print("Please provide trained model")
         return
-    # opt.extension_module = 'cpu'
     if opt.extension_module != 'cpu':
         if opt.mixed_precision:
             ctx = get_extension_context(
-                opt.extension_module, device_id="0", type_config="half")
+                opt.extension_module, device_id="0", type_config="half"
+            )
         else:
             ctx = get_extension_context(opt.extension_module, device_id="0")
         nn.set_default_context(ctx)
-    _, ext = os.path.splitext(opt.checkpoint)
+    _, ext = os.path.splitext(opt.trained_model_path)
     nn.set_auto_forward(True)
     Detector = detector_factory[opt.task]
     detector = Detector(opt)
@@ -71,8 +65,8 @@ def demo(opt):
                 image_names.append(os.path.join(opt.demo, file_name))
     else:
         image_names = [opt.demo]
-    for (image_name) in image_names:
-        assert(os.path.exists(image_name)), "{} not found.".format(image_name)
+    for image_name in image_names:
+        assert os.path.exists(image_name), "{} not found.".format(image_name)
         ret = detector.run(image_name)
 
         time_str = ''

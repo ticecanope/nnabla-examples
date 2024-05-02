@@ -19,6 +19,7 @@ from __future__ import print_function
 
 import argparse
 import os
+import glob
 from datasets.dataset.pascal_config import PascalVOCDefaultParams
 from datasets.dataset.coco_config import COCODefaultParams
 
@@ -36,8 +37,6 @@ class opts(object):
                                  help='ctdet')
         self.parser.add_argument('--dataset', default='coco',
                                  help='coco | pascal')
-        self.parser.add_argument('--exp_id', default='default')
-        self.parser.add_argument('--test', action='store_true')
         self.parser.add_argument('--debug', type=int, default=0,
                                  help='level of visualization.'
                                       '1: only show the final detection results'
@@ -50,12 +49,7 @@ class opts(object):
                                       'cpu | cuda | cudnn')
         self.parser.add_argument('--data_dir', type=str, default='/home/ubuntu/data/',
                                  help='Path to root directory of dataset.')
-        self.parser.add_argument('--root_output_dir', '-o', type=str,
-                                 default=os.path.join(
-                                     os.path.dirname(__file__), '..', '..'),
-                                 help='Path to root directory of output data.')
-        self.parser.add_argument('--save_dir', type=str,
-                                 default=None,
+        self.parser.add_argument('--save_dir', type=str, default=None,
                                  help='Path to directory for saving outputs of training and inference etc.')
 
         # system
@@ -69,7 +63,7 @@ class opts(object):
                                  help='number of epochs to run validation.')
         self.parser.add_argument('--save_intervals', type=int, default=5,
                                  help='number of epochs to save weights.')
-        self.parser.add_argument('--val_calc_map', action='store_true',
+        self.parser.add_argument('--disable_val_calc_map', action='store_true',
                                  help='Disable AP calculation during validation.')
         self.parser.add_argument('--metric', default='loss',
                                  help='main metric to save best model')
@@ -99,20 +93,24 @@ class opts(object):
                                  help='input width. -1 for default from dataset.')
 
         # train
-        self.parser.add_argument('--train-config', type=str,
-                                 help='YAML file for training config')
+        config_file_list = glob.glob(os.path.join(
+            os.path.dirname(__file__), '..', '..', 'cfg', '*.yaml'))
+        self.parser.add_argument('--config_file', type=str,
+                                 help=f'YAML file for training/inference config. eg. {config_file_list}')
         self.parser.add_argument('--weight_decay', type=float, default=0.0,
                                  help='weight decay parameter.')
-        self.parser.add_argument('--checkpoint', type=str, default='',
-                                 help='checkpoint file to resume training.')
         self.parser.add_argument('--mixed_precision', action='store_true',
                                  help='Mixed Precision training using NVIDIA tensor cores.')
         self.parser.add_argument('--channel_last', action='store_true',
                                  help='Channel last models. Currently only DLAv0 is supported')
-        self.parser.add_argument('--checkpoint_dir', type=str, default='',
-                                 help='Root folder that includes checkpoint(s) for test.')
-        self.parser.add_argument('--resume-from', type=int, default=None,
-                                 help='Resume training using a checkpoint state at the specified epoch. The training will start at an epoch `resume_epoch + 1`.')
+        self.parser.add_argument('--trained_model_path', type=str, default='',
+                                 help='Trained weight file(params*.h5) for inference or resuming training.')
+        self.parser.add_argument(
+            '--trained_model_dir', type=str, default='',
+            help='Root folder that includes trained weights(params*.h5) of each epoch to perform inference.')
+        self.parser.add_argument(
+            '--resume-from', type=int, default=None,
+            help='Resume training using a checkpoint state at the specified epoch. The training will start at an epoch `resume_epoch + 1`.')
 
         # test
         self.parser.add_argument('--test_scales', type=str, default='1',
@@ -168,10 +166,10 @@ class opts(object):
         else:
             opt = self.parser.parse_args(args)
 
-        # Load training config
-        if opt.train_config is not None:
-            opt.train_config = read_yaml(opt.train_config)
-            cfg = opt.train_config
+        # Load config
+        if opt.config_file is not None:
+            opt.config_file = read_yaml(opt.config_file)
+            cfg = opt.config_file
             opt.dataset = cfg.dataset.dataset
             opt.arch = cfg.model.arch
             opt.num_layers = cfg.model.num_layers
@@ -202,11 +200,17 @@ class opts(object):
         opt.pad = 31
         opt.num_stacks = 1
 
-        opt.exp_dir = os.path.join(opt.root_output_dir, "exp", opt.task)
         if opt.save_dir is None:
-            opt.save_dir = os.path.join(opt.exp_dir, opt.exp_id)
+            import datetime
+            top_dir = os.path.join(os.path.dirname(__file__), '..', '..')
+            timestamp = datetime.datetime.now().strftime('%Y%m%d%H%M%S')
+            opt.save_dir = os.path.join(
+                top_dir,
+                "exp",
+                f"{opt.task}_{opt.dataset}_{opt.arch}_{opt.num_layers}_{timestamp}"
+            )
         opt.debug_dir = os.path.join(opt.save_dir, 'debug')
-        print('The output will be saved to ', opt.save_dir)
+        print(f'The output will be saved to {opt.save_dir}')
         os.makedirs(opt.save_dir, exist_ok=True)
 
         return opt
@@ -228,9 +232,8 @@ class opts(object):
         opt.output_res = max(opt.output_h, opt.output_w)
         if opt.task == 'ctdet':
             # assert opt.dataset in ['pascal', 'coco']
-            opt.heads = {'hm': opt.num_classes,
-                         'wh': 2}  # if not opt.cat_spec_wh else 2 * opt.num_classes}
-            opt.heads.update({'reg': 2})
+            opt.heads = {'hm': opt.num_classes, 'reg': 2, 'wh': 2}
+            opt.dataset_info = {'max_objs': dataset.max_objs}
         else:
             assert 0, 'task {} not defined!'.format(opt.task)
         print('heads', opt.heads)
@@ -238,9 +241,9 @@ class opts(object):
 
     def init(self, args=''):
         default_dataset_info = {
-                'coco': COCODefaultParams,
-                'pascal': PascalVOCDefaultParams,
-                }
+            'coco': COCODefaultParams,
+            'pascal': PascalVOCDefaultParams,
+        }
         opt = self.parse(args)
         dataset = default_dataset_info[opt.dataset]
         opt = self.update_dataset_info_and_set_heads(opt, dataset)

@@ -16,7 +16,7 @@
 import numpy as np
 import os
 import nnabla as nn
-import nnabla.functions as F
+from nnabla.monitor import MonitorSeries
 
 from models.losses import FocalLoss
 from models.losses import L1Loss
@@ -40,10 +40,12 @@ class CtdetLoss(object):
         self.crit_reg = L1Loss()
         self.crit_wh = self.crit_reg
 
-    def __call__(self, pred_hm, pred_wh, pred_reg, hm, inds, wh, reg, reg_mask, comm=None, channel_last=False):
+    def __call__(
+            self, pred_hm, pred_wh, pred_reg, hm, inds, wh, reg, reg_mask,
+            comm=None, channel_last=False
+    ):
         with nn.context_scope(comm.ctx_float):
             loss, hm_loss, wh_loss, off_loss = 0.0, 0.0, 0.0, 0.0
-            eps = 1e-4
             hm_loss = self.crit.forward(pred_hm, hm)
             if self.opt.wh_weight > 0:
                 wh_loss = self.crit_wh.forward(
@@ -65,12 +67,13 @@ class CtdetLoss(object):
 class Trainer(object):
     # Super class which defines common methods for full precision and mixed precision training
 
-    def __init__(self, model, loss_func, solver, train_data_loader, train_data_source, logger, opt, comm=None,
-                 N=2000, scaling_factor=2.0):
+    def __init__(
+            self, model, solver, train_data_loader, train_data_source,
+            monitor, opt, comm=None, N=2000, scaling_factor=2.0
+    ):
 
         self.model = model
-        self.loss_func = loss_func
-        self.logger = logger
+        self.loss_func = CtdetLoss(opt)
         self.comm = comm
         self._iteration = 0
         self.data_loader = train_data_loader
@@ -78,10 +81,10 @@ class Trainer(object):
         self.solver = solver
         self.opt = opt
         train_size = opt.train_size
-        max_objs = 128
+        max_objs = opt.dataset_info['max_objs']
         batch_size = opt.batch_size
         self.iterations_per_epoch = int(
-                np.ceil(train_size / (comm.n_procs*batch_size)))
+            np.ceil(train_size / (comm.n_procs * batch_size)))
         self.weight_decay = opt.weight_decay
 
         # Mixed Precision parameters
@@ -97,23 +100,44 @@ class Trainer(object):
                 (opt.batch_size, opt.input_h, opt.input_w, channels))
             self._hm = nn.Variable(
                 (opt.batch_size, opt.output_h, opt.output_w, opt.num_classes))
-            self.pred_hm = nn.Variable(
-                (opt.batch_size, opt.output_h, opt.output_w, opt.num_classes))
         else:
             self._img = nn.Variable(
                 (opt.batch_size, channels, opt.input_h, opt.input_w))
             self._hm = nn.Variable(
                 (opt.batch_size, opt.num_classes, opt.output_h, opt.output_w))
-            self.pred_hm = nn.Variable(
-                (opt.batch_size, opt.num_classes, opt.output_h, opt.output_w))
         self._inds = nn.Variable((opt.batch_size, max_objs))
         self._wh = nn.Variable((opt.batch_size, max_objs, 2))
         self._reg = nn.Variable((opt.batch_size, max_objs, 2))
         self._reg_mask = nn.Variable((opt.batch_size, max_objs, 1))
-        self.pred_wh_map = nn.Variable(
-            (opt.batch_size, 2, opt.output_h, opt.output_w))
-        self.pred_reg_map = nn.Variable(
-            (opt.batch_size, 2, opt.output_h, opt.output_w))
+
+        # Construct the computation graph with dummy data.
+        _ = self.model(self._img)
+        self.solver.set_parameters(
+            nn.get_parameters(), reset=False, retain_state=True)
+        self._train_monitor = {
+            'loss': None, 'hm_loss': None, 'wh_loss': None, 'off_loss': None}
+        self._val_monitor = {'loss': None, 'hm_loss': None,
+                             'wh_loss': None, 'off_loss': None}
+
+        interval = 1
+        if comm.rank == 0:
+            self._train_monitor['loss'] = MonitorSeries(
+                "Training Loss", monitor, interval=interval, verbose=False)
+            self._train_monitor['hm_loss'] = MonitorSeries(
+                "hm_loss", monitor, interval=interval, verbose=False)
+            self._train_monitor['wh_loss'] = MonitorSeries(
+                "wh_loss", monitor, interval=interval, verbose=False)
+            self._train_monitor['off_loss'] = MonitorSeries(
+                "off_loss", monitor, interval=interval, verbose=False)
+
+            self._val_monitor['loss'] = MonitorSeries(
+                "Validation Loss", monitor, interval=interval, verbose=False)
+            self._val_monitor['hm_loss'] = MonitorSeries(
+                "val_hm_loss", monitor, interval=interval, verbose=False)
+            self._val_monitor['wh_loss'] = MonitorSeries(
+                "val_wh_loss", monitor, interval=interval, verbose=False)
+            self._val_monitor['off_loss'] = MonitorSeries(
+                "val_off_loss", monitor, interval=interval, verbose=False)
 
     def compute_gradient(self, data):
         loss = self.compute_loss(data)
@@ -153,7 +177,7 @@ class Trainer(object):
                 del loss, total_loss, hm_loss, wh_loss, off_loss
                 return self.compute_gradient(data)
             self._recursive_count = 0
-            self.solver.scale_grad(1./self.scale)
+            self.solver.scale_grad(1. / self.scale)
         return total_loss, hm_loss, wh_loss, off_loss
 
     def update(self, epoch):
@@ -175,24 +199,28 @@ class Trainer(object):
                     self._counter = 0
                 self._counter += 1
 
-            if self.logger[0] != None:
-                if self.comm.rank == 0:
-                    m_total_loss += total_loss.d.item() / self.iterations_per_epoch
-                    m_hm_loss += hm_loss.d.item() / self.iterations_per_epoch
-                    m_wh_loss += wh_loss.d.item() / self.iterations_per_epoch
-                    m_off_loss += off_loss.d.item() / self.iterations_per_epoch
-                    pbar.set_description(
-                        '[Train][exp_id:{}, epoch:{}/{}||loss:{:8.4f}, hm_loss:{:8.4f}, wh_loss:{:8.4f}, off_loss:{:8.4f}, lr:{:.2e}, scale:{:.2e}]'.format(
-                            self.opt.exp_id, epoch, self.opt.num_epochs, total_loss.d.item(), hm_loss.d.item(),
-                            wh_loss.d.item(), off_loss.d.item(), self.solver.learning_rate(),
-                            self.scale))
-
-        if self.logger[0] != None:
             if self.comm.rank == 0:
-                self.logger[0].add(epoch, m_total_loss)
-                self.logger[1].add(epoch, m_hm_loss)
-                self.logger[2].add(epoch, m_wh_loss)
-                self.logger[3].add(epoch, m_off_loss)
+                m_total_loss += total_loss.d.item() / self.iterations_per_epoch
+                m_hm_loss += hm_loss.d.item() / self.iterations_per_epoch
+                m_wh_loss += wh_loss.d.item() / self.iterations_per_epoch
+                m_off_loss += off_loss.d.item() / self.iterations_per_epoch
+
+                pbar_text = (
+                    f"[Train] epoch:{epoch}/{self.opt.num_epochs}||"
+                    f"loss:{total_loss.d.item():8.4f}, "
+                    f"hm_loss:{hm_loss.d.item():8.4f}, "
+                    f"wh_loss:{wh_loss.d.item():8.4f}, "
+                    f"off_loss:{wh_loss.d.item():8.4f}, "
+                    f"lr:{self.solver.learning_rate():.2e}, "
+                    f"scale:{self.scale:.2e}"
+                )
+                pbar.set_description(pbar_text)
+
+        if self.comm.rank == 0:
+            self._train_monitor['loss'].add(epoch, m_total_loss)
+            self._train_monitor['hm_loss'].add(epoch, m_hm_loss)
+            self._train_monitor['wh_loss'].add(epoch, m_wh_loss)
+            self._train_monitor['off_loss'].add(epoch, m_off_loss)
 
     def save_checkpoint(self, path, epoch):
         # path: saved_models_dir
@@ -200,18 +228,24 @@ class Trainer(object):
         os.makedirs(path, exist_ok=True)
         cu.save_checkpoint(path, epoch, self.solver)
 
-    def load_checkpont(self, path, epoch):
+    def load_checkpoint(self, path, epoch):
         from neu import checkpoint_util as cu
         checkpoint_file = os.path.join(
             path, 'checkpoint_{}.json'.format(epoch))
-        cu.load_checkpoint(checkpoint_file, self.solver)
+        return cu.load_checkpoint(checkpoint_file, self.solver)
 
     def compute_loss(self, data):
         # Performs forward pass.
         self._img.d, self._hm.d, self._inds.d, self._wh.d, self._reg.d, self._reg_mask.d, _ = data
-        pred_hm, pred_wh, pred_reg = self.model(self._img)
-        loss = self.loss_func(pred_hm, pred_wh, pred_reg, self._hm, self._inds, self._wh,
-                              self._reg, self._reg_mask, self.comm, channel_last=self.opt.channel_last)
+        pred_dict = self.model(self._img)
+        pred_hm = pred_dict['hm']
+        pred_wh = pred_dict['wh']
+        pred_reg = pred_dict['reg']
+        loss = self.loss_func(
+            pred_hm, pred_wh, pred_reg, self._hm, self._inds,
+            self._wh, self._reg, self._reg_mask, self.comm,
+            channel_last=self.opt.channel_last
+        )
         return loss
 
     def evaluate(self, val_data_loader, epoch):
@@ -239,16 +273,23 @@ class Trainer(object):
             wh_loss += loss['wh_loss'].d.item()
             off_loss += loss['off_loss'].d.item()
 
-            pbar.set_description(
-                '[Validation][exp_id:{}, epoch:{}/{}||loss:{:8.4f}, hm_loss:{:8.4f}, wh_loss:{:8.4f}, off_loss:{:8.4f}]'.format(
-                    self.opt.exp_id, epoch, self.opt.num_epochs, loss['loss'].d.item(
-                    ), loss['hm_loss'].d.item(),
-                    loss['wh_loss'].d.item(), loss['off_loss'].d.item()))
+            pbar_text = (
+                f"[Validation] epoch:{epoch}/{self.opt.num_epochs}||"
+                f"loss:{loss['loss'].d.item():8.4f}, "
+                f"hm_loss:{loss['hm_loss'].d.item():8.4f}, "
+                f"wh_loss:{loss['wh_loss'].d.item():8.4f}, "
+                f"off_loss:{loss['off_loss'].d.item():8.4f}"
+            )
+
+            pbar.set_description(pbar_text)
             del loss
-        if self.logger[4] != None:
-            if self.comm.rank == 0:
-                self.logger[4].add(epoch, total_loss /
-                                   val_iterations_per_epoch)
-                self.logger[5].add(epoch, hm_loss / val_iterations_per_epoch)
-                self.logger[6].add(epoch, wh_loss / val_iterations_per_epoch)
-                self.logger[7].add(epoch, off_loss / val_iterations_per_epoch)
+
+        if self.comm.rank == 0:
+            self._val_monitor['loss'].add(
+                epoch, total_loss / val_iterations_per_epoch)
+            self._val_monitor['hm_loss'].add(
+                epoch, hm_loss / val_iterations_per_epoch)
+            self._val_monitor['wh_loss'].add(
+                epoch, wh_loss / val_iterations_per_epoch)
+            self._val_monitor['off_loss'].add(
+                epoch, off_loss / val_iterations_per_epoch)

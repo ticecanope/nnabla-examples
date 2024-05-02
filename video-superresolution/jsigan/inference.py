@@ -53,7 +53,7 @@ def inference():
     nn.load_parameters(conf.pre_trained_model)
 
     for index in range(data_sz[0]):
-        ###======== Divide Into Patches ========###
+        ### ======== Divide Into Patches ======== ###
         for p in range(conf.test_patch ** 2):
             pH = p // conf.test_patch
             pW = p % conf.test_patch
@@ -74,12 +74,12 @@ def inference():
             inf_time.append(time.time() - st)
             test_pred_t = trim_patch_boundary(test_pred_temp, PATCH_BOUNDARY, data_sz[1], data_sz[2],
                                               pH, sH, pW, sW, conf.scaling_factor)
-            #pred_sz = test_pred_t.shape
+            # pred_sz = test_pred_t.shape
             test_pred_t = np.squeeze(test_pred_t)
             test_pred_full[pH * sH * conf.scaling_factor: (pH + 1) * sH * conf.scaling_factor,
                            pW * sW * conf.scaling_factor: (pW + 1) * sW * conf.scaling_factor, :] = test_pred_t
 
-        ###======== Compute PSNR & Print Results========###
+        ### ======== Compute PSNR & Print Results======== ###
         test_GT = np.squeeze(target.d[index, :, :, :])
         test_PSNR = compute_psnr(test_pred_full, test_GT, 1.)
         test_loss_PSNR_list_for_epoch.append(test_PSNR)

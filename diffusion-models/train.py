@@ -13,119 +13,198 @@
 # limitations under the License.
 
 
+import fnmatch
 import os
+import queue
 import sys
 
-import fnmatch
-
-import click
+import hydra
 import nnabla as nn
 import nnabla.solvers as S
+import nnabla_diffusion.config as config
 import numpy as np
-
 from neu.checkpoint_util import load_checkpoint, save_checkpoint
-from neu.misc import AttrDict, get_current_time, init_nnabla
+from neu.misc import get_current_time, init_nnabla
+from neu.mixed_precision import MixedPrecisionManager
 from neu.reporter import KVReporter, save_tiled_image
-from neu.yaml_wrapper import write_yaml
+from neu.solvers import PackedParameterSolver
+from nnabla.logger import logger
+from nnabla_diffusion.dataset import get_dataset
+from nnabla_diffusion.diffusion_model.diffusion import is_learn_sigma
+from nnabla_diffusion.diffusion_model.layers import adaptive_pooling_2d
+from nnabla_diffusion.diffusion_model.model import Model
+from nnabla_diffusion.diffusion_model.utils import (create_ema_op,
+                                                    get_lr_scheduler,
+                                                    init_checkpoint_queue,
+                                                    sum_grad_norm)
+from omegaconf import OmegaConf
 
-from dataset import get_dataset
-from model import Model
-from utils import get_warmup_lr, sum_grad_norm, create_ema_op
-from config import refine_args_by_dataset
-from diffusion import ModelVarType, is_learn_sigma
+
+def refine_monitor_files(dir_path, start_iter):
+    for filename in os.listdir(dir_path):
+        if filename.endswith(("series.txt", "timer.txt")):
+            contents = []
+            with open(os.path.join(dir_path, filename), "r") as f:
+                for line in f.readlines():
+                    iter = line.strip().split(" ")[0]
+                    if int(iter) >= start_iter:
+                        break
+
+                    contents.append(line)
+
+            with open(os.path.join(dir_path, filename), "w") as f:
+                f.write("".join(contents))
+
+
+def setup_resume(output_dir, dataset, solvers, is_master=False):
+    # return
+    start_iter = 0
+    new_output_dir = output_dir
+
+    parent = os.path.dirname(os.path.abspath(output_dir))
+
+    if not os.path.exists(parent):
+        # no previous checkpoint, train from scratch.
+        return start_iter, output_dir
+
+    all_logs = sorted(fnmatch.filter(
+        os.listdir(parent), "*{}*".format(dataset)))
+    if len(all_logs):
+        latest_dir = os.path.join(parent, all_logs[-1])
+        checkpoints = sorted(fnmatch.filter(
+            os.listdir(latest_dir), "checkpoint_*.json"))
+
+        # extract iteration count and use it as key
+        iter_cp = [(int(x.split(".")[0].split("_")[-1]), x)
+                   for x in checkpoints]
+
+        for iter, checkpoint in reversed(sorted(iter_cp)):
+            try:
+                cp_path = os.path.join(latest_dir, checkpoint)
+                start_iter = load_checkpoint(cp_path, solvers)
+
+                for sname, slv in solvers.items():
+                    slv.zero_grad()
+
+                if is_master:
+                    refine_monitor_files(latest_dir, start_iter)
+                    init_checkpoint_queue(latest_dir)
+
+                new_output_dir = latest_dir
+                logger.info(f"Load checkpoint from {cp_path}")
+
+                break
+            except:
+                logger.warning(
+                    f"{checkpoint} is broken. Try to load previous checkpoints.")
+        else:
+            logger.warning("No valid checkpoint. Train from scratch")
+
+    return start_iter, new_output_dir
 
 
 def get_output_dir_name(org, dataset):
     return os.path.join(org, f"{get_current_time()}_{dataset}")
 
 
-def str_as_integer_list(ctx, param, value):
-    if value is None or len(value) == 0:
-        return None
+def augmentation(x, channel_last, random_flip):
+    import nnabla.functions as F
+    aug = x
 
-    return tuple(int(x) for x in value.split(","))
+    if random_flip:
+        aug = F.random_flip(aug, axes=[2, ] if channel_last else None)
+
+    return aug
 
 
-@click.command()
-# configs for training process
-@click.option("--accum", default=1, help="# of gradient accumulation.", show_default=True)
-@click.option("--device-id", default='0', help="Device id.", show_default=True)
-@click.option("--batch-size", default=4, help="Batch size to train.", show_default=True)
-@click.option("--n-iters", default=int(5e5), help="# of training iterations.", show_default=True)
-@click.option("--progress/--no-progress", default=False, help="Use tqdm to show progress.")
-@click.option("--resume/--no-resume", default=False, help="Resume training from the latest params saved at the same output_dir.")
-@click.option("--loss-scaling", default=1.0, type=float, help="Loss scaling factor.", show_default=True)
-@click.option("--lr", default=None, type=float, help="Learning rate.")
-# model configs
-@click.option("--beta-strategy", default="linear", help="Strategy to create betas.", show_default=True,
-              type=click.Choice(["linear", "cosine"], case_sensitive=False), show_choices=True)
-@click.option("--num-diffusion-timesteps", default=1000, help="Number of diffusion timesteps.", show_default=True)
-@click.option("--ssn/--no-ssn", default=True, type=bool, help="use scale shift norm or not.")
-@click.option("--num-attention-heads", default=4, type=int, help="Number of multihead attention heads", show_default=True)
-@click.option("--attention-resolutions", default="16,8", type=str, callback=str_as_integer_list,
-              help="Resolutions which attention is applied. Comma separated string should be passed. If None, use default for dataset.")
-@click.option("--base-channels", default=None, type=int, help="Base channel size. If None, use default for dataset.")
-@click.option("--channel-mult", default=None, type=str, callback=str_as_integer_list,
-              help="Channel multipliers for each block. Comma separated string should be passed. If None, use default for dataset.")
-@click.option("--num-res-blocks", default=None, type=int, help="# of residual blocks. If None, use default for dataset.")
-@click.option("--dropout", default=0.0, type=float, help="Dropout prob.", show_default=True)
-@click.option("--model-var-type", type=click.Choice(ModelVarType.get_supported_keys(), case_sensitive=False),
-              default="fixed_small", help="A type of the model variance.", show_default=True, show_choices=True)
-# data related configs
-@click.option("--dataset", default="custum", help="Dataset name to train model on.",
-              type=click.Choice(["celebahq", "cifar10", "imagenet", "custom"], case_sensitive=False), show_choices=True)
-@click.option("--image-size", default=None,
-              type=int, help="Image size. Should be a integer and used for both height and width.")
-@click.option("--data-dir", default="./data", help="The path for data directory.", show_default=True)
-@click.option("--dataset-root-dir", default=None,
-              help="The path for dataset root directory.", show_default=True)
-@click.option("--dataset-on-memory/--no-dataset-on-memory", default=False,
-              help="If True, the data once loaded will be kept on Host memory.", show_default=True)
-@click.option("--fix-aspect-ratio/--no-fix-aspect-ratio", default=True,
-              help="Whether keep aspect ratio or not for loaded training images.", show_default=True)
-# configs for dumpling
-@click.option("--output-dir", default="./logdir", help="output dir", show_default=True)
-@click.option("--save-interval", default=int(1e4), help="Number of iters between saves.", show_default=True)
-@click.option("--gen-interval", default=int(1e4), help="Number of iters between each generation.", show_default=True)
-@click.option("--show-interval", default=10, help="Number of iters between showing current logging values.", show_default=True)
-@click.option("--dump-grad-norm/--no-dump-grap-norm",
-              default=False, help="Show sum of gradient norm of all params for each iteration.")
-def main(**kwargs):
-    # set training args
-    args = AttrDict(kwargs)
-    refine_args_by_dataset(args)
+def create_gen_config(conf: config.TrainScriptConfig,
+                      respacing_step: int) -> config.GenScriptConfig:
+    conf_gen: config.GenScriptConfig \
+         = OmegaConf.masked_copy(conf, ["diffusion", "model"])
 
-    args.output_dir = get_output_dir_name(args.output_dir, args.dataset)
+    # setup respacing
+    conf_gen.diffusion.respacing_step = respacing_step
 
-    comm = init_nnabla(ext_name="cudnn", device_id=args.device_id,
-                       type_config="float", random_pseed=True)
+    # disable dropout
+    conf_gen.model.dropout = 0
 
-    data_iterator = get_dataset(args, comm)
+    OmegaConf.set_readonly(conf_gen, True)
 
-    model = Model(beta_strategy=args.beta_strategy,
-                  num_diffusion_timesteps=args.num_diffusion_timesteps,
-                  model_var_type=ModelVarType.get_vartype_from_key(
-                      args.model_var_type),
-                  attention_num_heads=args.num_attention_heads,
-                  attention_resolutions=args.attention_resolutions,
-                  scale_shift_norm=args.ssn,
-                  base_channels=args.base_channels,
-                  channel_mult=args.channel_mult,
-                  num_res_blocks=args.num_res_blocks)
+    return conf_gen
+
+
+@hydra.main(version_base=None, config_path="yaml/", config_name="config_train")
+def main(conf: config.TrainScriptConfig):
+    # setup output dir
+    conf.train.output_dir = get_output_dir_name(conf.train.output_dir,
+                                                conf.dataset.name)
+
+    # initialize nnabla runtime and get communicator
+    comm = init_nnabla(ext_name="cudnn",
+                       device_id=conf.runtime.device_id,
+                       type_config="float",  # mixed precision is handled in unet.py
+                       random_pseed=True)
+
+    # create data iterator
+    data_iterator = get_dataset(conf.dataset, comm)
 
     # build graph
-    x = nn.Variable(args.image_shape)  # assume data_iterator returns [0, 255]
-    x_rescaled = x / 127.5 - 1  # rescale to [-1, 1]
-    loss_dict, t = model.build_train_graph(x_rescaled,
-                                           dropout=args.dropout,
-                                           loss_scaling=None if args.loss_scaling == 1.0 else args.loss_scaling)
-    assert loss_dict.batched_loss.shape == (args.batch_size, )
-    assert t.shape == (args.batch_size, )
-    assert t.persistent == True
+    model = Model(diffusion_conf=conf.diffusion,
+                  model_conf=conf.model)
+
+    # setup input image
+    # assume data_iterator returns [-1, 1]
+    x = nn.Variable((conf.train.batch_size, ) + conf.model.image_shape)
+    x_aug = augmentation(x, conf.model.channel_last,
+                         random_flip=conf.dataset.random_flip)
+
+    # create low-resolution image
+    model_kwargs = {}
+    if conf.model.low_res_size is not None:
+        assert len(conf.model.low_res_size) == 2
+        x_low_res = adaptive_pooling_2d(x_aug,
+                                        conf.model.low_res_size,
+                                        mode="average",
+                                        channel_last=conf.model.channel_last)
+
+        # gaussian conditioning augmentation
+        if conf.train.noisy_low_res:
+            x_low_res, aug_level = model.gaussian_conditioning_augmentation(
+                x_low_res)
+            model_kwargs["input_cond_aug_timestep"] = aug_level
+
+        # create model_kwargs
+        model_kwargs["input_cond"] = x_low_res
+
+    # set cond drop rate for classifier-free guidance
+    model_kwargs["cond_drop_rate"] = conf.train.cond_drop_rate
+
+    # setup class condition
+    if conf.model.class_cond:
+        model_kwargs["class_label"] = nn.Variable((conf.train.batch_size, ))
+
+    # setup text condition
+    if conf.model.text_cond:
+        assert conf.model.text_emb_shape is not None
+        model_kwargs["text_emb"] = nn.Variable(
+            (conf.train.batch_size, ) + conf.model.text_emb_shape)
+
+    loss_dict, t = model.build_train_graph(x_aug,
+                                           loss_scaling=None if conf.train.loss_scaling == 1.0 else conf.train.loss_scaling,
+                                           model_kwargs=model_kwargs)
+    assert loss_dict.batched_loss.shape == (conf.train.batch_size, )
+    assert t.shape == (conf.train.batch_size, )
 
     # optimizer
     solver = S.Adam()
     solver.set_parameters(nn.get_parameters())
+
+    # Packing parameters to make solver faster
+    solver: PackedParameterSolver \
+        = PackedParameterSolver(solver, use_ema=True)
+
+    # learning rate scheduler
+    lr_scheduler = get_lr_scheduler(conf.train)
 
     # for ema update
     # Note: this should be defined after solver.set_parameters() to avoid update by solver.
@@ -143,137 +222,265 @@ def main(**kwargs):
     }
 
     start_iter = 0  # exclusive
-    if args.resume:
-        parent = os.path.dirname(os.path.abspath(args.output_dir))
-        all_logs = sorted(fnmatch.filter(
-            os.listdir(parent), "*{}*".format(args.dataset)))
-        if len(all_logs):
-            latest_dir = os.path.join(parent, all_logs[-1])
-            checkpoints = sorted(fnmatch.filter(
-                os.listdir(latest_dir), "checkpoint_*.json"))
-            if len(checkpoints):
-                latest_cp = os.path.join(latest_dir, checkpoints[-1])
-                start_iter = load_checkpoint(latest_cp, solvers)
+    if conf.train.resume:
+        # when resume, use the previous output_dir having the last checkpoint.
+        start_iter, output_dir = setup_resume(conf.train.output_dir,
+                                              conf.dataset.name,
+                                              solvers, is_master=comm.rank == 0)
+        conf.train.output_dir = output_dir
 
-                for sname, slv in solvers.items():
-                    slv.zero_grad()
+    # setup output directory for generated images during training
+    image_dir = os.path.join(conf.train.output_dir, "image")
+    if comm.rank == 0:
+        os.makedirs(image_dir, exist_ok=True)
+
     comm.barrier()
 
     # Reporter
-    reporter = KVReporter(comm, save_path=args.output_dir,
+    reporter = KVReporter(comm, save_path=conf.train.output_dir,
                           skip_kv_to_monitor=False)
     # set all keys before to prevent synchronization error
     for i in range(4):
         reporter.set_key(f"loss_q{i}")
-        if is_learn_sigma(model.model_var_type):
+        if is_learn_sigma(conf.model.model_var_type):
             reporter.set_key(f"vlb_q{i}")
 
-    image_dir = os.path.join(args.output_dir, "image")
-    if comm.rank == 0:
-        os.makedirs(image_dir, exist_ok=True)
-
-    if args.progress:
+    if conf.train.progress:
         from tqdm import trange
-        piter = trange(start_iter + 1, args.n_iters + 1,
+        piter = trange(start_iter + 1, conf.train.n_iters + 1,
                        disable=comm.rank > 0, ncols=0)
     else:
-        piter = range(start_iter + 1, args.n_iters + 1)
+        piter = range(start_iter + 1, conf.train.n_iters + 1)
+
+    # freeze config to disable setting or updating values in conf.
+    OmegaConf.resolve(conf)
+    OmegaConf.set_readonly(conf, True)
+
+    # setup model for generation
+    conf_gen = create_gen_config(conf, respacing_step=4)
+    gen_model = Model(diffusion_conf=conf_gen.diffusion,
+                      model_conf=conf_gen.model)
 
     # dump config
     if comm.rank == 0:
-        args.dump()
-        write_yaml(os.path.join(args.output_dir, "config.yaml"), args)
+        # show configs in stdout
+        logger.info("===== configs =====")
+        print(OmegaConf.to_yaml(conf))
+
+        # save configs
+        OmegaConf.save(conf, os.path.join(
+            conf.train.output_dir, "config_train.yaml"))
+        OmegaConf.save(conf_gen, os.path.join(
+            conf.train.output_dir, "config_gen.yaml"))
 
     comm.barrier()
 
+    # setup mixed precision training if needed
+    mpm = MixedPrecisionManager(
+        use_fp16=conf.model.use_mixed_precision,
+        initial_log_loss_scale=10)
+
+    # Queue to keep data instances for input_cond during sampling
+    num_gen = 16
+    data_queue = queue.Queue(maxsize=num_gen)
+
     for i in piter:
-        # update solver's lr
-        # cur_lr = get_warmup_lr(lr, args.n_warmup, i)
-        solver.set_learning_rate(args.lr)
+        # update learning rate
+        if lr_scheduler is not None:
+            cur_lr = lr_scheduler._get_lr(i, None)
+        else:
+            cur_lr = conf.train.lr
+
+        # rescale lr to cancel backward accumulation
+        solver.set_learning_rate(cur_lr / conf.train.accum)
 
         # evaluate graph
         dummy_solver_ema.zero_grad()  # just in case
         solver.zero_grad()
-        for accum_iter in range(args.accum):  # accumelate
-            data, label = data_iterator.next()
-            x.d = data.copy()
+
+        retry_cnt = 0
+        accum_cnt = 0
+        while accum_cnt < conf.train.accum:
+            batch = data_iterator.next()
+            data = batch[0]
+            x.d = data
+
+            label = batch[1]  # if laion, this should be caption.
+
+            text_emb = [None, ] * conf.train.batch_size
+            if conf.model.text_cond:
+                text_emb = batch[2]
+                model_kwargs["text_emb"].d = text_emb
+
+            if conf.model.class_cond:
+                model_kwargs["class_label"].d = label
+
+            # keep data for input_condition in generation step
+            for data_idx in range(conf.train.batch_size):
+                if data_queue.full():
+                    break
+
+                data_queue.put(
+                    (data[data_idx], label[data_idx], text_emb[data_idx]))
 
             loss_dict.loss.forward(clear_no_need_grad=True)
+            mpm.backward(loss_dict.loss,
+                         clear_buffer=True)
 
-            all_reduce_cb = None
-            if accum_iter == args.accum - 1:
-                all_reduce_cb = comm.get_all_reduce_callback(
-                    params=solver.get_parameters().values())
+            # Retry from the first accumulation step if overflow happens.
+            if mpm.is_grad_overflow(solver):
+                retry_cnt += 1
 
-            loss_dict.loss.backward(
-                clear_buffer=True, communicator_callbacks=all_reduce_cb)
+                # Raise if retry happens too many times.
+                if retry_cnt == 100:
+                    raise ValueError("Overflow happens too many times.")
 
-            # logging
-            # loss
+                # mpm.backward resets grad of all params to zero in this case.
+                accum_cnt = 0
+                continue
+
+            # fwd/bwd successes. Count up accum_cnt.
+            accum_cnt += 1
+
+            # reporting
             reporter.kv_mean("loss", loss_dict.loss)
 
-            if is_learn_sigma(model.model_var_type):
+            if is_learn_sigma(conf.model.model_var_type):
                 reporter.kv_mean("vlb", loss_dict.vlb)
 
             # loss for each quantile
-            for j in range(args.batch_size):
+            for j in range(conf.train.batch_size):
                 ti = t.d[j]
-                q_level = int(ti) * 4 // args.num_diffusion_timesteps
+                q_level = int(ti) * 4 // conf.diffusion.max_timesteps
                 assert q_level in (
                     0, 1, 2, 3), f"q_level should be one of [0, 1, 2, 3], but {q_level} is given."
                 reporter.kv_mean(f"loss_q{q_level}", float(
                     loss_dict.batched_loss.d[j]))
 
-                if is_learn_sigma(model.model_var_type):
+                if is_learn_sigma(conf.model.model_var_type):
                     reporter.kv_mean(f"vlb_q{q_level}", loss_dict.vlb.d[j])
 
+        # gradient accumulation
+        assert accum_cnt == conf.train.accum
+
         # update
-        if args.grad_clip > 0:
-            solver.clip_grad_by_norm(args.grad_clip)
-        solver.update()
+        mpm.scale_grad(solver)
+        if isinstance(solver, PackedParameterSolver):
+            comm.all_reduce([x.grad for x in solver.packed_params],
+                            division=True, inplace=True)
+        else:
+            comm.all_reduce(
+                [x.grad for x in solver.get_parameters().values()], division=True, inplace=True)
+        mpm.update(solver, clip_grad=conf.train.clip_grad)
 
         # update ema params
-        ema_op.forward(clear_no_need_grad=True)
+        if isinstance(solver, PackedParameterSolver) and solver.use_ema:
+            solver.updata_ema_params(decay=0.9999)
+        else:
+            ema_op.forward(clear_no_need_grad=True)
 
         # grad norm
-        if args.dump_grad_norm:
+        if conf.train.dump_grad_norm:
             gnorm = sum_grad_norm(solver.get_parameters().values())
             reporter.kv_mean("grad", gnorm)
 
         # samples
-        reporter.kv("samples", i * args.batch_size * comm.n_procs * args.accum)
+        reporter.kv("samples", i * conf.train.batch_size *
+                    comm.n_procs * conf.train.accum)
 
         # iteration (only for no-progress)
-        if not args.progress:
+        if not conf.train.progress:
             reporter.kv("iteration", i)
 
-        if i % args.show_interval == 0:
-            if args.progress:
-                desc = reporter.desc(reset=True, sync=True)
+        if i % conf.train.show_interval == 0:
+            if conf.train.progress:
+                desc = reporter.desc(
+                    reset=True, sync=True)
                 piter.set_description(desc=desc)
             else:
                 reporter.dump(file=sys.stdout if comm.rank ==
-                              0 else None, reset=True, sync=True)
+                              0 else None, reset=True, sync=False)  # True
 
             reporter.flush_monitor(i)
 
-        if i > 0 and i % args.save_interval == 0:
+        if i % conf.train.save_interval == 0:
             if comm.rank == 0:
-                save_checkpoint(args.output_dir, i, solvers, n_keeps=3)
+                save_checkpoint(conf.train.output_dir, i, solvers,
+                                n_keeps=3,
+                                split_h5_per_solver=True)
 
             comm.barrier()
 
-        if i > 0 and i % args.gen_interval == 0:
+        if conf.train.gen_interval > 0 and i % conf.train.gen_interval == 0:
             # sampling
-            sample_out, _, _ = model.sample(
-                shape=(16, ) + x.shape[1:], use_ema=True, progress=False)
-            assert sample_out.shape == (16, ) + args.image_shape[1:]
+            gen_model_kwargs = {}
+
+            # setup condition vectors
+            assert data_queue.qsize() == num_gen, \
+                f"queue size is smaller than expected. ({data_queue.qsize()} < {num_gen})"
+            image_list = []
+            label_list = []
+            text_emb_list = []
+            for _ in range(num_gen):
+                image, label, text_emb = data_queue.get()
+                image_list.append(image)
+                label_list.append(label)
+                text_emb_list.append(text_emb)
+
+            if conf.model.low_res_size is not None:
+                # create lowres input from training dataset
+                input_cond = nn.Variable.from_numpy_array(np.stack(image_list))
+
+                input_cond_lowres = adaptive_pooling_2d(input_cond, conf.model.low_res_size,
+                                                        mode="average",
+                                                        channel_last=conf.model.channel_last)
+                input_cond_lowres.forward(clear_buffer=True)
+
+                gen_model_kwargs["input_cond"] = input_cond_lowres.get_unlinked_variable(
+                    need_grad=False)
+                gen_model_kwargs["input_cond_aug_timestep"] = nn.Variable.from_numpy_array(
+                    np.zeros((num_gen, )))
+
+            # disable dropping condition for generation
+            gen_model_kwargs["cond_drop_rate"] = 0
+
+            # class cond
+            if conf.model.class_cond:
+                if conf.model.low_res_size is not None:
+                    # use class id for lowres image for the upsampler
+                    gen_class_label = nn.Variable.from_numpy_array(
+                        np.stack(label_list))
+                else:
+                    # use random class id for the base model
+                    gen_class_label = nn.Variable.from_numpy_array(np.random.randint(low=0,
+                                                                                     high=conf.model.num_classes,
+                                                                                     size=(num_gen, )))
+
+                gen_model_kwargs["class_label"] = gen_class_label
+
+            if conf.model.text_cond:
+                gen_model_kwargs["text_emb"] = nn.Variable.from_numpy_array(
+                    np.asarray(text_emb_list))
+
+                assert gen_model_kwargs["text_emb"].shape == (
+                    num_gen, ) + model_kwargs["text_emb"].shape[1:]
+
+            sample_out, _, _ = gen_model.sample(shape=(num_gen, ) + x.shape[1:],
+                                                model_kwargs=gen_model_kwargs,
+                                                use_ema=True, progress=False)
+            assert sample_out.shape == (num_gen, ) + x.shape[1:]
 
             # scale back to [0, 255]
             sample_out = (sample_out + 1) * 127.5
 
             save_path = os.path.join(image_dir, f"gen_{i}_{comm.rank}.png")
-            save_tiled_image(sample_out.astype(np.uint8), save_path)
+
+            save_tiled_image(sample_out.astype(np.uint8),
+                             save_path, channel_last=conf.model.channel_last)
+
+            if conf.model.text_cond:
+                with open(os.path.join(image_dir, f"gen_{i}_{comm.rank}_script.txt"), "w") as f:
+                    f.write("\n".join(label_list))
 
 
 if __name__ == "__main__":

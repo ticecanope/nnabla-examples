@@ -1,4 +1,4 @@
-# Copyright 2021 Sony Group Corporation.
+# Copyright 2022 Sony Group Corporation.
 #
 # Licensed under the Apache License, Version 2.0 (the "License");
 # you may not use this file except in compliance with the License.
@@ -15,27 +15,33 @@
 from typing import Dict, Tuple
 import argparse
 import os
+import numpy as np
 
 import nnabla as nn
 from nnabla.ext_utils import get_extension_context
 from nnabla.utils.data_iterator import DataIterator
 from nnabla.logger import logger
 
-from model import pointnet_classification
+from pointnet import pointnet_classification
 from loss import classification_loss_with_orthogonal_loss
-from data.modelnet40_normal_resampled_dataiter import data_iterator_modelnet40_normal_resampled
-from running_utils import categorical_accuracy, load_snapshot, set_global_seed
+from running_utils import categorical_accuracy
+
+# Install neu (nnabla examples utils) to import these functions.
+# See [NEU](https://github.com/nnabla/nnabla-examples/tree/master/utils).
+from neu.datasets.modelnet40_normal_resampled import data_iterator_modelnet40_normal_resampled
+from neu.checkpoint_util import load_checkpoint
 
 
 def eval_one_epoch(
     valid_data_iter: DataIterator,
     valid_vars: Dict[str, nn.Variable],
     valid_loss_vars: Dict[str, nn.Variable],
-) -> Tuple[str, str]:
+) -> Tuple[np.ndarray, np.ndarray]:
     total_steps = 0
     total_accuracy = 0.0
     total_loss = 0.0
     num_iterations = valid_data_iter.size // valid_data_iter.batch_size
+
     for _ in range(num_iterations):
         point_cloud, label = valid_data_iter.next()
 
@@ -80,14 +86,21 @@ def evaluate(args):
                        "pred": pred_valid, **internal_losses_valid}
 
     # Load snapshot
-    load_snapshot(args.snapshot_dir)
+    load_checkpoint(args.checkpoint_json_path, {})
 
     # Data Iterator
     valid_data_iter = data_iterator_modelnet40_normal_resampled(
-        args.data_dir, valid_batch_size, False, False, args.num_points, normalize=True, stop_exhausted=True
+        args.data_dir,
+        valid_batch_size,
+        False,
+        False,
+        args.num_points,
+        normalize=True,
+        with_normal=False,
     )
+    logger.info(f"Validation dataset size: {valid_data_iter.size}")
 
-    # Training-loop
+    # Evaluation
     logger.info(f"Evaluation starting ...")
     accuracy, loss = eval_one_epoch(
         valid_data_iter, valid_vars, valid_loss_vars)
@@ -105,8 +118,11 @@ def main():
 
     parser.add_argument("--device_id", type=int, default=0)
     parser.add_argument("--context", type=str, default="cudnn")
-    parser.add_argument("--snapshot_dir", type=str,
-                        default="./pointnet_classification_result/seed_100/best")
+    parser.add_argument(
+        "--checkpoint_json_path",
+        type=str,
+        default="./pointnet_classification_result/seed_100/checkpoint_best/checkpoint_best.json",
+    )
 
     args = parser.parse_args()
     evaluate(args)

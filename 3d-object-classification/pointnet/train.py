@@ -1,4 +1,4 @@
-# Copyright 2021 Sony Group Corporation.
+# Copyright 2022 Sony Group Corporation.
 #
 # Licensed under the Apache License, Version 2.0 (the "License");
 # you may not use this file except in compliance with the License.
@@ -15,6 +15,7 @@
 from typing import Dict
 import argparse
 import os
+import numpy as np
 
 import nnabla as nn
 from nnabla.ext_utils import get_extension_context
@@ -23,10 +24,16 @@ import nnabla.solvers as S
 from nnabla.logger import logger
 from nnabla.monitor import Monitor, MonitorSeries
 
-from model import pointnet_classification
+from pointnet import pointnet_classification
 from loss import classification_loss_with_orthogonal_loss
-from data.modelnet40_normal_resampled_dataiter import data_iterator_modelnet40_normal_resampled
-from running_utils import categorical_accuracy, save_snapshot, set_global_seed, get_decayed_learning_rate
+from running_utils import categorical_accuracy, set_global_seed
+
+# Install neu (nnabla examples utils) to import these functions.
+# See [NEU](./utils).
+from neu.datasets.modelnet40_normal_resampled import data_iterator_modelnet40_normal_resampled
+from neu.checkpoint_util import save_checkpoint
+from neu.learning_rate_scheduler import create_learning_rate_scheduler
+from neu.misc import AttrDict
 
 
 def train_one_epoch(
@@ -40,10 +47,10 @@ def train_one_epoch(
     global_steps: int,
 ) -> int:
     total_steps = global_steps
-    train_data_iter._reset()
+    num_iterations = train_data_iter.size // train_data_iter.batch_size
 
-    for batch_data in train_data_iter:
-        point_cloud, label = batch_data
+    for _ in range(num_iterations):
+        point_cloud, label = train_data_iter.next()
 
         train_vars["point_cloud"].d = point_cloud
         train_vars["label"].d = label
@@ -79,10 +86,10 @@ def eval_one_epoch(
     total_steps = 0
     total_accuracy = 0.0
     total_loss = 0.0
-    valid_data_iter._reset()
+    num_iterations = valid_data_iter.size // valid_data_iter.batch_size
 
-    for batch_data in valid_data_iter:
-        point_cloud, label = batch_data
+    for _ in range(num_iterations):
+        point_cloud, label = valid_data_iter.next()
 
         valid_vars["point_cloud"].d = point_cloud
         valid_vars["label"].d = label
@@ -104,7 +111,8 @@ def eval_one_epoch(
 
 def train(args):
     # Create out dir
-    outdir = os.path.join(args.result_dir, f"seed_{args.seed}")
+    outdir = os.path.abspath(os.path.join(
+        args.result_dir, f"seed_{args.seed}"))
     os.makedirs(outdir, exist_ok=True)
 
     # Set context
@@ -174,22 +182,46 @@ def train(args):
 
     # Data Iterator
     train_data_iter = data_iterator_modelnet40_normal_resampled(
-        args.data_dir, args.batch_size, True, True, args.num_points, normalize=True, stop_exhausted=True
+        args.data_dir,
+        args.batch_size,
+        True,
+        True,
+        args.num_points,
+        normalize=True,
+        with_normal=False,
+        rng=args.seed,
     )
+    logger.info(f"Training dataset size: {train_data_iter.size}")
     valid_data_iter = data_iterator_modelnet40_normal_resampled(
-        args.data_dir, valid_batch_size, False, False, args.num_points, normalize=True, stop_exhausted=True
+        args.data_dir,
+        valid_batch_size,
+        False,
+        False,
+        args.num_points,
+        normalize=True,
+        with_normal=False,
+        rng=args.seed,
     )
+    logger.info(f"Validation dataset size: {valid_data_iter.size}")
 
     # Training-loop
     global_steps = 0
     decayed_learning_rate = args.learning_rate
     best_accuracy = 0.0
+    learning_rate_config = {
+        "scheduler_type": "EpochStepLearningRateScheduler",
+        "base_lr": args.learning_rate,
+        "decay_at": np.arange(20, args.max_epoch, 20),
+        "decay_rate": 0.7,
+        "warmup_epochs": 0,
+    }
+    learning_rate_scheduler = create_learning_rate_scheduler(
+        AttrDict(learning_rate_config))
 
     for i in range(1, args.max_epoch + 1):
         logger.info(f"Training {i} th epoch...")
-        decayed_learning_rate = get_decayed_learning_rate(
-            i, decayed_learning_rate)
-
+        decayed_learning_rate = learning_rate_scheduler.get_lr_and_update()
+        logger.info(f"Learning rate {decayed_learning_rate}")
         global_steps = train_one_epoch(
             train_data_iter,
             train_vars,
@@ -201,18 +233,22 @@ def train(args):
             global_steps,
         )
 
+        learning_rate_scheduler.set_epoch(i + 1)
+
         if i % args.eval_interval == 0:
             logger.info(f"Evaluation at {i} th epoch ...")
             accuracy = eval_one_epoch(
                 valid_data_iter, valid_vars, valid_loss_vars, valid_monitors, global_steps)
-            save_dir = os.path.join(outdir, "epoch_{}".format(i))
-            save_snapshot(save_dir)
+            checkpoint_outdir = os.path.join(outdir, f"checkpoint_{i}")
+            os.makedirs(checkpoint_outdir, exist_ok=True)
+            save_checkpoint(checkpoint_outdir, i, solver)
 
             if accuracy > best_accuracy:
                 logger.info("Update best and save current parameters")
                 best_accuracy = accuracy
-                save_dir = os.path.join(outdir, "best")
-                save_snapshot(save_dir)
+                best_outdir = os.path.join(outdir, "checkpoint_best")
+                os.makedirs(best_outdir, exist_ok=True)
+                save_checkpoint(best_outdir, "best", solver)
 
 
 def main():
